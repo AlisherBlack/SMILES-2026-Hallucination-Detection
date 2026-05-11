@@ -96,25 +96,3 @@ What we take:
 
 What we skip: prompt wrapping (requires a second forward + chases a
 cross-domain effect we do not have), leave-one-domain-out.
-
----
-
-## Convergence across papers
-
-| Aspect | SAPLMA | INSIDE | Orgad | PRISM | Result |
-|---|---|---|---|---|---|
-| Token | last statement | last middle layer | exact answer / end-of-q | last wrapped | H1: end-of-q + last response |
-| Layer | sweep, mid-to-late | middle | middle-to-late | last/middle | H2: middle/late + variance-ratio screening |
-| Probe | 3-layer MLP 256-128-64 | n/a | LR L2 | MM | H3: LR L2 + MM |
-| Geom features | — | EigenScore | — | variance ratio | H4: eigenvalue features |
-
----
-
-## Hypothesis priorities (by expected gain)
-
-See `docs/plan.md` step 5 for details. Briefly:
-
-1. H1 (token position) — Orgad, +10–18 AUC. Do first.
-2. H2 (layer scan) — +5–10 AUC. Screen via variance ratio (PRISM).
-3. H3 (probe LR L2 + MM) — stability ±2–5 AUC, protection against overfit.
-4. H4 (eigenvalue features) — +1–3 AUC. Optional, only if H1–H3 do not close the day.
