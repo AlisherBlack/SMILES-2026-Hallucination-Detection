@@ -1,122 +1,126 @@
 """
-aggregation.py — Token aggregation strategy and feature extraction
-               (student-implemented).
+aggregation.py — H4 chunk-layer grid aggregation.
 
-Converts per-token, per-layer hidden states from the extraction loop in
-``solution.py`` into flat feature vectors for the probe classifier.
+For each sample we emit a flat vector of size (len(LAYERS) * 4 * hidden_dim):
 
-Two stages can be customised independently:
+    layers = (13, 15, 17, 24)
+    pools  = (response_head, response_mid, response_tail, last_seq)
 
-  1. ``aggregate`` — select layers and token positions, pool into a vector.
-  2. ``extract_geometric_features`` — optional hand-crafted features
-     (enabled by setting ``USE_GEOMETRIC = True`` in ``solution.py``).
-
-Both stages are combined by ``aggregation_and_feature_extraction``, the
-single entry point called from the notebook.
+Response token positions are computed in solution.py via the helpers below
+(same logic as experiments/h4_chunk_layer_pca.py): offsets_mapping when the
+tokenizer is fast, tokenizer.encode(prompt) length otherwise, fallback to the
+last token.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import torch
+
+
+LAYERS = (13, 15, 17, 24)
+
+
+def response_positions_from_offsets(
+    prompt: str,
+    input_ids_row: torch.Tensor,
+    attention_mask_row: torch.Tensor,
+    offsets_row: torch.Tensor,
+    eos_id: int,
+) -> list[int]:
+    n_real = int(attention_mask_row.sum().item())
+    response_start_char = len(str(prompt))
+    ids = input_ids_row[:n_real]
+    offsets = offsets_row[:n_real].tolist()
+
+    positions: list[int] = []
+    for pos, ((_, end), token_id) in enumerate(zip(offsets, ids.tolist())):
+        if token_id == eos_id:
+            continue
+        if end > response_start_char:
+            positions.append(pos)
+    return positions
+
+
+def response_positions_from_prompt_len(
+    prompt: str,
+    input_ids_row: torch.Tensor,
+    attention_mask_row: torch.Tensor,
+    tokenizer,
+    eos_id: int,
+) -> list[int]:
+    n_real = int(attention_mask_row.sum().item())
+    prompt_len = len(tokenizer.encode(str(prompt), add_special_tokens=False))
+    start = min(prompt_len, max(0, n_real - 1))
+
+    real_ids = input_ids_row[:n_real]
+    eos_positions = (real_ids == eos_id).nonzero(as_tuple=True)[0]
+    stop = int(eos_positions[-1].item()) if eos_positions.numel() > 0 else n_real
+    return list(range(start, max(start, stop)))
+
+
+def fallback_response_positions(
+    attention_mask_row: torch.Tensor,
+    input_ids_row: torch.Tensor,
+    eos_id: int,
+) -> list[int]:
+    n_real = int(attention_mask_row.sum().item())
+    if n_real <= 1:
+        return [0]
+    last_pos = n_real - 1
+    if int(input_ids_row[last_pos].item()) == eos_id and last_pos > 0:
+        return [last_pos - 1]
+    return [last_pos]
+
+
+def _split_response_chunks(
+    positions: list[int],
+) -> tuple[list[int], list[int], list[int]]:
+    arr = np.array(positions, dtype=int)
+    n = len(arr)
+    head_end = max(1, int(np.ceil(n / 3)))
+    mid_start = min(n - 1, n // 3)
+    mid_end = min(n, max(mid_start + 1, int(np.ceil(2 * n / 3))))
+    tail_start = max(0, n - head_end)
+    return arr[:head_end].tolist(), arr[mid_start:mid_end].tolist(), arr[tail_start:].tolist()
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
+    response_positions: list[int],
 ) -> torch.Tensor:
-    """Convert per-token hidden states into a single feature vector.
+    real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
+    last_pos = int(real_positions[-1].item())
 
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-                        Layer index 0 is the token embedding; index -1 is the
-                        final transformer layer.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+    head, mid, tail = _split_response_chunks(response_positions)
+    pools = (head, mid, tail, [last_pos])
 
-    Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` or
-        ``(k * hidden_dim,)`` if multiple layers are concatenated.
+    parts: list[torch.Tensor] = []
+    for layer_idx in LAYERS:
+        layer_hidden = hidden_states[layer_idx]
+        for pool in pools:
+            indices = torch.tensor(pool, dtype=torch.long, device=layer_hidden.device)
+            parts.append(layer_hidden.index_select(0, indices).mean(dim=0))
 
-    Student task:
-        Replace or extend the skeleton below with alternative layer selection,
-        token pooling (mean, max, weighted), or multi-layer fusion strategies.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
-
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
-
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
-
-    feature = layer[last_pos]          # (hidden_dim,)
-
-    return feature
-    # ------------------------------------------------------------------
+    return torch.cat(parts, dim=0).float().cpu()
 
 
 def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Extract hand-crafted geometric / statistical features from hidden states.
-
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
-    returned tensor is concatenated with the output of ``aggregate``.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-
-    Returns:
-        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
-        must be the same for every sample.
-
-    Student task:
-        Replace the stub below.  Possible features: layer-wise activation
-        norms, inter-layer cosine similarity (representation drift), or
-        sequence length.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
-
-    # Placeholder: returns an empty tensor (no geometric features).
     return torch.zeros(0)
 
 
 def aggregation_and_feature_extraction(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
+    response_positions: list[int],
     use_geometric: bool = False,
 ) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
-
-    Main entry point called from ``solution.ipynb`` for each sample.
-    Concatenates the output of ``aggregate`` with that of
-    ``extract_geometric_features`` when ``use_geometric=True``.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
-                        for a single sample.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-        use_geometric:  Whether to append geometric features.  Controlled by
-                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
-
-    Returns:
-        A 1-D float tensor of shape ``(feature_dim,)`` where
-        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
-        concatenations).
-    """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
-
+    agg = aggregate(hidden_states, attention_mask, response_positions)
     if use_geometric:
-        geo_features = extract_geometric_features(hidden_states, attention_mask)
-        return torch.cat([agg_features, geo_features], dim=0)
-
-    return agg_features
+        geo = extract_geometric_features(hidden_states, attention_mask)
+        return torch.cat([agg, geo], dim=0)
+    return agg

@@ -45,11 +45,53 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from aggregation import aggregation_and_feature_extraction
+from aggregation import (
+    aggregation_and_feature_extraction,
+    fallback_response_positions,
+    response_positions_from_offsets,
+    response_positions_from_prompt_len,
+)
 from evaluate import print_summary, run_evaluation, save_predictions, save_results
 from model import MAX_LENGTH, get_model_and_tokenizer
 from probe import HallucinationProbe
 from splitting import split_data
+
+
+def _tokenize_with_offsets(tokenizer, batch_texts):
+    try:
+        encoding = tokenizer(
+            batch_texts,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+        )
+        offsets = encoding.pop("offset_mapping")
+        return encoding, offsets
+    except Exception:
+        encoding = tokenizer(
+            batch_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+        )
+        return encoding, None
+
+
+def _response_positions(prompt, ids_row, mask_row, offsets_row, tokenizer, eos_id):
+    if offsets_row is not None:
+        positions = response_positions_from_offsets(
+            prompt, ids_row, mask_row, offsets_row, eos_id,
+        )
+    else:
+        positions = response_positions_from_prompt_len(
+            prompt, ids_row, mask_row, tokenizer, eos_id,
+        )
+    if not positions:
+        positions = fallback_response_positions(mask_row, ids_row, eos_id)
+    return positions
 
 # ---------------------------------------------------------------------
 
@@ -80,8 +122,9 @@ if __name__=='__main__':
     df = pd.read_csv(DATA_FILE)
 
     # Build the text fed to the LLM: concatenation of prompt and response.
-    all_texts  = [f"{row['prompt']}{row['response']}" for _, row in df.iterrows()]
-    all_labels = np.array([int(float(h)) for h in df["label"]])
+    all_texts   = [f"{row['prompt']}{row['response']}" for _, row in df.iterrows()]
+    all_prompts = [str(row['prompt']) for _, row in df.iterrows()]
+    all_labels  = np.array([int(float(h)) for h in df["label"]])
 
     n_total = len(all_labels)
     print(f"Loaded {n_total} samples  "
@@ -111,6 +154,10 @@ if __name__=='__main__':
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
+    eos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    if eos_id is None or eos_id == tokenizer.unk_token_id:
+        eos_id = tokenizer.eos_token_id
+
     all_features: list = []
     t0 = time.time()
 
@@ -118,14 +165,9 @@ if __name__=='__main__':
                     desc="Extracting & aggregating", unit="batch"):
 
         # ── 1. Tokenise the current mini-batch ───────────────────────────────
-        batch_texts = all_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
+        batch_texts   = all_texts[start : start + BATCH_SIZE]
+        batch_prompts = all_prompts[start : start + BATCH_SIZE]
+        encoding, offsets = _tokenize_with_offsets(tokenizer, batch_texts)
         input_ids      = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
 
@@ -138,15 +180,26 @@ if __name__=='__main__':
 
         # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
         # Shape: (batch, n_layers, seq_len, hidden_dim)
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        hidden       = torch.stack(outputs.hidden_states, dim=1).float()
+        mask         = attention_mask.cpu()
+        ids          = input_ids.cpu()
+        offsets_cpu  = offsets.cpu() if offsets is not None else None
 
         # ── 4. Aggregate each sample and store the compact feature vector ─────
         # The raw `hidden` tensor is released at the end of this loop iteration.
         for i in range(hidden.size(0)):
+            positions = _response_positions(
+                batch_prompts[i],
+                ids[i],
+                mask[i],
+                offsets_cpu[i] if offsets_cpu is not None else None,
+                tokenizer,
+                eos_id,
+            )
             feat = aggregation_and_feature_extraction(
                 hidden[i],   # (n_layers, seq_len, hidden_dim)
                 mask[i],     # (seq_len,)
+                positions,
                 use_geometric=USE_GEOMETRIC,
             )
             all_features.append(feat.cpu())
@@ -176,9 +229,10 @@ if __name__=='__main__':
     
 
     # ── Load test data ────────────────────────────────────────────────────────
-    df_test    = pd.read_csv(TEST_FILE)
-    test_texts = [f"{row['prompt']}{row['response']}" for _, row in df_test.iterrows()]
-    test_ids   = df_test.index
+    df_test      = pd.read_csv(TEST_FILE)
+    test_texts   = [f"{row['prompt']}{row['response']}" for _, row in df_test.iterrows()]
+    test_prompts = [str(row['prompt']) for _, row in df_test.iterrows()]
+    test_ids     = df_test.index
     print(f"Test set loaded: {len(test_texts)} samples")
 
     # ── Extract features for test set (same loop as Section 4) ───────────────
@@ -187,26 +241,31 @@ if __name__=='__main__':
     for start in tqdm(range(0, len(test_texts), BATCH_SIZE),
                     desc="Test extraction & aggregation", unit="batch"):
 
-        batch_texts = test_texts[start : start + BATCH_SIZE]
-        encoding = tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
+        batch_texts   = test_texts[start : start + BATCH_SIZE]
+        batch_prompts = test_prompts[start : start + BATCH_SIZE]
+        encoding, offsets = _tokenize_with_offsets(tokenizer, batch_texts)
         input_ids      = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
 
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
+        hidden      = torch.stack(outputs.hidden_states, dim=1).float()
+        mask        = attention_mask.cpu()
+        ids         = input_ids.cpu()
+        offsets_cpu = offsets.cpu() if offsets is not None else None
 
         for i in range(hidden.size(0)):
+            positions = _response_positions(
+                batch_prompts[i],
+                ids[i],
+                mask[i],
+                offsets_cpu[i] if offsets_cpu is not None else None,
+                tokenizer,
+                eos_id,
+            )
             feat = aggregation_and_feature_extraction(
-                hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                hidden[i], mask[i], positions, use_geometric=USE_GEOMETRIC,
             )
             test_features.append(feat.cpu())
 

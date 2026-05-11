@@ -18,53 +18,52 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+N_SPLITS_DEFAULT = 5
+VAL_SIZE_DEFAULT = 0.15
+RANDOM_STATE_DEFAULT = 42
 
 
 def split_data(
     y: np.ndarray,
     df: pd.DataFrame | None = None,
-    test_size: float = 0.15,
-    val_size: float = 0.15,
-    random_state: int = 42,
+    n_splits: int = N_SPLITS_DEFAULT,
+    val_size: float = VAL_SIZE_DEFAULT,
+    random_state: int = RANDOM_STATE_DEFAULT,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
+    """Stratified K-fold split with an inner train/val partition.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    For each of ``n_splits`` outer folds the indices are partitioned into
+    ``(train, val, test)``: ``test`` is the held-out fold from
+    ``StratifiedKFold``; the remaining indices are split into ``train`` and
+    ``val`` with a stratified ``val_size`` fraction.
+
+    EDA confirms ``unique_prompts_train == n_train`` and no shared prompts
+    between train and test, so a stratified random split is leakage-safe; no
+    group-aware split is needed.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
-        df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
+        df:           Optional full DataFrame (unused; kept for API contract).
+        n_splits:     Number of outer folds for cross-validation.
+        val_size:     Fraction of the (train+val) portion reserved for val.
         random_state: Random seed for reproducible splits.
 
     Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
+        A list of ``n_splits`` ``(idx_train, idx_val, idx_test)`` tuples.
     """
+    y = np.asarray(y)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    idx = np.arange(len(y))
-
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
-
+    splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
+    for idx_train_val, idx_test in skf.split(np.zeros(len(y)), y):
+        idx_train, idx_val = train_test_split(
+            idx_train_val,
+            test_size=val_size,
+            random_state=random_state,
+            stratify=y[idx_train_val],
+        )
+        splits.append((idx_train, idx_val, idx_test))
+    return splits
