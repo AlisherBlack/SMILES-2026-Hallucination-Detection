@@ -25,8 +25,8 @@ python solution.py                            # → results.json + predictions.c
 `python solution.py` yields `test AUROC 0.7885` / `test accuracy 0.7649` / `test F1 0.8460` (per-fold val-tuned threshold).
 
 Artefacts produced by the run:
-- `results.json` — per-fold metrics → [results.json](TODO_RESULTS_LINK)
-- `predictions.csv` — final labels for `data/test.csv` → [predictions.csv](TODO_PREDICTIONS_LINK)
+- `results.json` — per-fold metrics → [results.json](https://disk.yandex.ru/d/wVasAariVgt5vg)
+- `predictions.csv` — final labels for `data/test.csv` → [predictions.csv](https://disk.yandex.ru/d/tHXS3lBCHD6JAg)
 
 Threshold 0.421707 is hard-coded in `probe.py` as the default from the p7 OOF calibration. `fit_hyperparameters()` overrides it per-fold inside `evaluate.run_evaluation` (val-tuned); for the final fit in `solution.py`, `fit_hyperparameters` is not called, so 0.421707 is used.
 
